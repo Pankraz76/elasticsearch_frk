@@ -381,9 +381,12 @@ public class FsDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
          * <p>
          * As part of flushing stored disk when indexing sorting is active,
          * three tmp files are created, fdm (metadata), fdx (index) and
-         * fdt (contains stored field data). The first two files are small and
-         * mmap-ing that should still be ok even is memory is scarce.
+         * fdt (contains stored field data). The fdm file is small and read once,
+         * so mmap-ing it should still be ok even is memory is scarce.
          * The fdt file is large and tends to cause more page faults when memory is scarce.
+         * The fdx file is small too, but it is not opened with READONCE, so with arena grouping
+         * disabled it gets its own shared arena. Closing that arena is a JVM-wide handshake,
+         * paid on every sorted flush, which can stall threads under CPU contention (#163846).
          *
          * For disi, address-data, block-addresses, and block-doc-ranges files, in es819 tsdb doc values codec,
          * docids and offsets are first written to a tmp file and read and written into new segment.
@@ -396,7 +399,14 @@ public class FsDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
             return extension == LuceneFilesExtensions.TMP && NO_MMAP_FILE_SUFFIXES.stream().anyMatch(name::contains);
         }
 
-        static final Set<String> NO_MMAP_FILE_SUFFIXES = Set.of("fdt", "disi", "address-data", "block-addresses", "block-doc-ranges");
+        static final Set<String> NO_MMAP_FILE_SUFFIXES = Set.of(
+            "fdt",
+            "fdx",
+            "disi",
+            "address-data",
+            "block-addresses",
+            "block-doc-ranges"
+        );
 
         MMapDirectory getDelegate() {
             return delegate;
