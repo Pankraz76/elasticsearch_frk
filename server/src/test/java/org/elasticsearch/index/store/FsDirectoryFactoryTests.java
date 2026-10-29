@@ -8,6 +8,17 @@
  */
 package org.elasticsearch.index.store;
 
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.document.StoredField;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.StoredFields;
+import org.apache.lucene.search.Sort;
+import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.SortedNumericSortField;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
@@ -92,9 +103,15 @@ public class FsDirectoryFactoryTests extends ESTestCase {
             // Stored field tmp files that shouldn't preload:
             assertFalse(FsDirectoryFactory.HybridDirectory.useDelegate("foo.fdt__0.tmp", newIOContext(random())));
             assertFalse(FsDirectoryFactory.HybridDirectory.useDelegate("_0.fdt__1.tmp", newIOContext(random())));
+            // closing an mmapped tmp fdx closes a shared arena, a JVM-wide handshake on every sorted flush
+            assertFalse(FsDirectoryFactory.HybridDirectory.useDelegate("_0.fdx__4.tmp", newIOContext(random())));
             // Stored field tmp files that should preload:
             assertTrue(FsDirectoryFactory.HybridDirectory.useDelegate("_0.fdm__0.tmp", newIOContext(random())));
-            assertTrue(FsDirectoryFactory.HybridDirectory.useDelegate("_0.fdx__4.tmp", newIOContext(random())));
+            // Term vector tmp files are unaffected:
+            assertTrue(FsDirectoryFactory.HybridDirectory.useDelegate("_0.tvx__2.tmp", newIOContext(random())));
+            // Final stored field files never use mmap:
+            assertFalse(FsDirectoryFactory.HybridDirectory.useDelegate("_0.fdx", newIOContext(random())));
+            assertFalse(FsDirectoryFactory.HybridDirectory.useDelegate("_0.fdt", newIOContext(random())));
             // es819 tsdb doc values tmp files that shouldn't preload:
             assertFalse(FsDirectoryFactory.HybridDirectory.useDelegate("foo.disi__0.tmp", newIOContext(random())));
             assertFalse(FsDirectoryFactory.HybridDirectory.useDelegate("foo.address-data__0.tmp", newIOContext(random())));
@@ -104,6 +121,61 @@ public class FsDirectoryFactoryTests extends ESTestCase {
             assertTrue(func.test("foo.dvd", newIOContext(random())));
             assertTrue(func.test("foo.tmp", newIOContext(random())));
             fsDirectoryFactory.preLoadFuncMap.clear();
+        }
+    }
+
+    /**
+     * A flush with index sorting writes stored fields to tmp files and reads them back through the
+     * directory. The tmp fdx is opened without READONCE, so if it went to the mmap delegate it would
+     * get a shared arena whose close is a JVM-wide handshake. Checks that a real sorted flush keeps
+     * the tmp fdx and fdt off mmap, and that the segment still reads back correctly.
+     */
+    public void testSortedFlushDoesNotMmapTempStoredFieldsIndex() throws IOException {
+        final List<String> mmapOpened = new CopyOnWriteArrayList<>();
+        final Path path = createTempDir();
+        final MMapDirectory recordingDelegate = new MMapDirectory(path) {
+            @Override
+            public IndexInput openInput(String name, IOContext context) throws IOException {
+                mmapOpened.add(name);
+                return super.openInput(name, context);
+            }
+        };
+        final int numDocs = randomIntBetween(10, 500);
+        final Sort indexSort = new Sort(new SortedNumericSortField("sort", SortField.Type.LONG));
+        final IndexWriterConfig iwc = new IndexWriterConfig().setIndexSort(indexSort);
+        try (Directory dir = new FsDirectoryFactory.HybridDirectory(NoLockFactory.INSTANCE, recordingDelegate, 0)) {
+            try (IndexWriter writer = new IndexWriter(dir, iwc)) {
+                for (int i = 0; i < numDocs; i++) {
+                    final long sortValue = randomLong();
+                    final Document doc = new Document();
+                    doc.add(new SortedNumericDocValuesField("sort", sortValue));
+                    doc.add(new StoredField("id", i));
+                    doc.add(new StoredField("sort", sortValue));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+            }
+
+            // the READONCE tmp fdm still goes to mmap: proves the sorted flush ran and the recorder sees it
+            assertThat(mmapOpened, Matchers.hasItem(Matchers.matchesPattern(".*\\.fdm__.*\\.tmp")));
+            assertThat(mmapOpened, not(Matchers.hasItem(Matchers.matchesPattern(".*\\.fd[tx]__.*\\.tmp"))));
+
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                assertEquals(numDocs, reader.numDocs());
+                final Set<Integer> ids = new HashSet<>();
+                for (LeafReaderContext leaf : reader.leaves()) {
+                    final StoredFields storedFields = leaf.reader().storedFields();
+                    long previous = Long.MIN_VALUE;
+                    for (int docId = 0; docId < leaf.reader().maxDoc(); docId++) {
+                        final Document doc = storedFields.document(docId);
+                        assertTrue(ids.add(doc.getField("id").numericValue().intValue()));
+                        final long sortValue = doc.getField("sort").numericValue().longValue();
+                        assertThat(sortValue, Matchers.greaterThanOrEqualTo(previous));
+                        previous = sortValue;
+                    }
+                }
+                assertEquals(numDocs, ids.size());
+            }
         }
     }
 
