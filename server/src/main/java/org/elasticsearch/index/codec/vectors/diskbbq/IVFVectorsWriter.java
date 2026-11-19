@@ -56,6 +56,11 @@ import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
  */
 public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
 
+    /**
+     * Number of iterations of a per-vector merge loop between two {@link MergeState#checkAborted()} calls. Must be a power of two.
+     */
+    static final int MERGE_ABORT_CHECK_INTERVAL = 1 << 10;
+
     private final List<FieldWriter> fieldWriters = new ArrayList<>();
     private final IndexOutput ivfCentroids, ivfClusters;
     private final IndexOutput ivfMeta;
@@ -609,9 +614,24 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         throw new IllegalArgumentException("Unsupported vector values type: " + vectorValues.getClass());
     }
 
+    /**
+     * Checks whether the merge has been aborted once every {@link #MERGE_ABORT_CHECK_INTERVAL} iterations of a per-vector loop.
+     * IVF merges of large segments can run for hours, and Lucene only checks for aborts before a codec's merge starts, so
+     * long-running merge loops must poll explicitly for close, relocation and shutdown not to wait for them. Checking
+     * periodically rather than on every iteration keeps the cost of {@link MergeState#checkAborted()}, which may be
+     * overridden to do more than a volatile read, off the hot path.
+     */
+    protected static void checkAbortedPeriodically(MergeState mergeState, int iteration) throws IOException {
+        if ((iteration & (MERGE_ABORT_CHECK_INTERVAL - 1)) == 0) {
+            mergeState.checkAborted();
+        }
+    }
+
     @Override
     public final IORunnable mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
         IvfSegmentConfig resolvedConfig = resolveMergeConfig(fieldInfo, mergeState);
+        // resolving the merge config may run calibration on the merged vectors
+        mergeState.checkAborted();
         if (fieldInfo.getVectorEncoding().equals(VectorEncoding.FLOAT32)
             || (fieldInfo.getVectorEncoding().equals(VectorEncoding.BYTE) && supportsByteNative())) {
             mergeOneFieldIVF(fieldInfo, mergeState, resolvedConfig);
@@ -620,6 +640,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             writeMeta(fieldInfo, 0, 0, 0, 0, 0, null, 0, 0, 0, 0, IvfSegmentConfig.NONE, false);
         }
         // we merge the vectors at the end so we only have two copies of the vectors on disk at the same time.
+        mergeState.checkAborted();
         rawVectorDelegate.mergeOneField(fieldInfo, mergeState);
         return null;
     }
@@ -727,7 +748,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
                 if (docsOut != null) {
                     docsFileName = docsOut.getName();
                 }
-                vectorCount = writeVectorValues(fieldInfo, docsOut, vectorsOut, mergedVectorValues, preconditioner);
+                vectorCount = writeVectorValues(fieldInfo, docsOut, vectorsOut, mergedVectorValues, preconditioner, mergeState);
                 CodecUtil.writeFooter(vectorsOut);
                 if (docsOut != null) {
                     CodecUtil.writeFooter(docsOut);
@@ -783,6 +804,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
                 centroidTemp = mergeState.segmentInfo.dir.createTempOutput(mergeState.segmentInfo.name, "civf_", IOContext.DEFAULT);
                 centroidTempName = centroidTemp.getName();
                 CentroidInformation<?> centroidAssignments = calculateCentroids(fieldInfo, vectorValues, mergeState);
+                mergeState.checkAborted();
                 // write the centroids to a temporary file so we are not holding them on heap
                 if (supportsByteNative() && centroidAssignments.centroids() instanceof byte[][] byteCentroidArrays) {
                     // Write byte centroids to temp file
@@ -831,6 +853,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
                     // write initial centroid index (we might need to read it later for overspilling)
                     centroidOffset = ivfCentroids.alignFilePointer(Float.BYTES);
                     CI centroidIndex = writeCentroidIndex(centroidSupplier, assignments.assignments(), ivfCentroids);
+                    mergeState.checkAborted();
 
                     // write posting lists
                     postingListOffset = ivfClusters.alignFilePointer(Float.BYTES);
@@ -846,6 +869,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
                         ivfSegmentConfig
                     );
                     postingListLength = ivfClusters.getFilePointer() - postingListOffset;
+                    mergeState.checkAborted();
 
                     // write the rest of the centroid data now we know the size of the postings
                     writeCentroidData(
@@ -911,7 +935,8 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         IndexOutput docsOut,
         IndexOutput vectorsOut,
         KnnVectorValues mergedVectorValues,
-        Preconditioner preconditioner
+        Preconditioner preconditioner,
+        MergeState mergeState
     ) throws IOException {
         int numVectors = 0;
         int dim = fieldInfo.getVectorDimension();
@@ -926,6 +951,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
 
         final KnnVectorValues.DocIndexIterator iterator = mergedVectorValues.iterator();
         for (int docV = iterator.nextDoc(); docV != NO_MORE_DOCS; docV = iterator.nextDoc()) {
+            checkAbortedPeriodically(mergeState, numVectors);
             numVectors++;
             switch (encoding) {
                 case BYTE -> {

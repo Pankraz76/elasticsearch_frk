@@ -314,6 +314,7 @@ public class ES940DiskBBQVectorsWriter extends IVFVectorsWriter<ES940DiskBBQVect
             byte[] binary = new byte[quantEncoding.getDocPackedLength(fieldInfo.getVectorDimension())];
             float[] scratch = new float[fieldInfo.getVectorDimension()];
             for (int i = 0; i < assignments.length; i++) {
+                checkAbortedPeriodically(mergeState, i);
                 int c = assignments[i];
                 float[] centroid = centroidSupplier.centroid(c);
                 float[] parentCentroid = centroidClusters.getCentroid(c);
@@ -426,6 +427,7 @@ public class ES940DiskBBQVectorsWriter extends IVFVectorsWriter<ES940DiskBBQVect
             final int[] clusterOrds = new int[maxPostingListSize];
             DocIdsWriter idsWriter = new DocIdsWriter();
             for (int c = 0; c < centroidSupplier.size(); c++) {
+                mergeState.checkAborted();
                 float[] centroid = centroidSupplier.centroid(c);
                 int[] cluster = assignmentsByCluster[c];
                 boolean[] isOverspill = isOverspillByCluster[c];

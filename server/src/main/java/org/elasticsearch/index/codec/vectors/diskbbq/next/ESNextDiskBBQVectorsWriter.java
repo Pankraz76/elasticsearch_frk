@@ -358,6 +358,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             float[] scratch = new float[fieldInfo.getVectorDimension()];
             final boolean isByte = vectorValues instanceof ByteVectorValues;
             for (int i = 0; i < assignments.length; i++) {
+                checkAbortedPeriodically(mergeState, i);
                 // record where this vector's centroid data starts
                 vectorCentroidOffsets.add(quantizedVectorsTemp.getFilePointer());
                 int c = assignments[i];
@@ -500,6 +501,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             final int[] clusterOrds = new int[maxPostingListSize];
             DocIdsWriter idsWriter = new DocIdsWriter();
             for (int c = 0; c < centroidSupplier.size(); c++) {
+                mergeState.checkAborted();
                 int[] cluster = assignmentsByCluster[c];
                 int[] vectorCentroidIdx = overspillVectorIdx[c];
                 long offset = postingsOutput.alignFilePointer(Float.BYTES) - fileOffset;
